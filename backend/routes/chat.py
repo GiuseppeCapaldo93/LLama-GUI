@@ -9,7 +9,9 @@ import urllib.request
 from backend import config
 from backend.http import SseWriter, sanitize_sse_error
 from backend.services import chat as chat_service
+from backend.services import local_files
 from backend.services import process_manager
+from backend.services import web_render
 from backend.services import web_search
 
 
@@ -31,48 +33,123 @@ def completions(request, response, ctx):
     try:
         messages = list(body.get("messages") or [])
         proxied_messages = messages
+        active_runtime = process_manager.get_active_runtime_snapshot(ctx)
+        vision_active = bool(active_runtime and active_runtime.get("vision"))
+        vision_image_urls = []
 
-        if body.get("web_search"):
+        web_search_on = bool(body.get("web_search"))
+        latest_user = chat_service.get_latest_user_message(messages)
+        pasted_urls = chat_service.extract_urls(latest_user)
+        file_paths = local_files.extract_file_paths(latest_user)
+        refs_from_history = False
+        if not pasted_urls and not file_paths and chat_service.references_previous_page(latest_user):
+            history_urls = chat_service.find_recent_urls(messages)
+            history_files = local_files.find_recent_file_paths(messages)
+            if history_urls or history_files:
+                pasted_urls = history_urls
+                file_paths = history_files
+                refs_from_history = True
+        has_direct_content = bool(pasted_urls or file_paths)
+
+        # Run the read/search pipeline when the user turned on Web Search, or
+        # whenever they referenced a URL/file/image (so reading local files and
+        # pages "just works" without toggling Web Search).
+        if web_search_on or has_direct_content:
             max_results = get_web_search_result_count(body)
-            latest_user = chat_service.get_latest_user_message(messages)
-            queries = chat_service.build_search_queries(latest_user)
             all_results = []
             fetched_pages = {}
 
-            for query in queries:
-                writer.write({"type": "web_status", "content": f"Searching: {query}"})
-                search_response = web_search.web_search(query, max_results=max_results)
-                if not search_response.get("ok"):
-                    writer.write({"error": {"message": search_response.get("error", "Search unavailable")}})
-                    writer.write("[DONE]")
-                    return
-                for result in search_response.get("results", []):
-                    if result.get("url") and all(r.get("url") != result.get("url") for r in all_results):
-                        all_results.append(result)
-                    if len(all_results) >= max_results:
-                        break
+            if has_direct_content:
+                # The user referenced specific content (a URL and/or a local file
+                # path): read those directly instead of running a search. This is
+                # what lets the model read an intranet page (rendered with a real
+                # browser), a local file such as an exported CV, or an image.
+                if refs_from_history:
+                    writer.write(
+                        {
+                            "type": "web_status",
+                            "content": "Using the link/file from earlier in the conversation.",
+                        }
+                    )
+                for file_path in file_paths[:max_results]:
+                    name = file_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+                    writer.write({"type": "web_status", "content": f"Reading file: {name}"})
+                    file_result = local_files.read_local_file(file_path)
+                    key = f"file:///{file_path}"
+                    fetched_pages[key] = file_result
+                    if not file_result.get("ok"):
+                        writer.write(
+                            {
+                                "type": "web_status",
+                                "content": f"Could not read {name}: {str(file_result.get('error', ''))[:160]}",
+                            }
+                        )
+                    all_results.append({"title": file_path, "url": key, "snippet": ""})
+                    if vision_active and local_files.is_image_path(file_path):
+                        data_url = local_files.encode_image_data_url(file_path)
+                        if data_url:
+                            vision_image_urls.append(data_url)
+                            writer.write(
+                                {"type": "web_status", "content": f"Viewing image: {name}"}
+                            )
+                for url in pasted_urls[:max_results]:
+                    host = urllib.parse.urlparse(url).hostname or url
+                    if host.startswith("www."):
+                        host = host[4:]
+                    writer.write({"type": "web_status", "content": f"Reading: {host}"})
+                    page = web_render.fetch_page_smart(url, ssl_context=ctx.services.ssl_context)
+                    fetched_pages[url] = page
+                    if not page.get("ok"):
+                        writer.write(
+                            {
+                                "type": "web_status",
+                                "content": f"Could not read {host}: {str(page.get('error', ''))[:160]}",
+                            }
+                        )
+                    all_results.append({"title": url, "url": url, "snippet": ""})
+            else:
+                queries = chat_service.build_search_queries(latest_user)
 
-            for result in all_results[:max_results]:
-                url = result.get("url", "")
-                host = urllib.parse.urlparse(url).hostname or url
-                if host.startswith("www."):
-                    host = host[4:]
-                writer.write({"type": "web_status", "content": f"Reading: {host}"})
-                fetched_pages[url] = web_search.fetch_page_text(url, ssl_context=ctx.services.ssl_context)
+                for query in queries:
+                    writer.write({"type": "web_status", "content": f"Searching: {query}"})
+                    search_response = web_search.web_search(query, max_results=max_results)
+                    if not search_response.get("ok"):
+                        writer.write({"error": {"message": search_response.get("error", "Search unavailable")}})
+                        writer.write("[DONE]")
+                        return
+                    for result in search_response.get("results", []):
+                        if result.get("url") and all(r.get("url") != result.get("url") for r in all_results):
+                            all_results.append(result)
+                        if len(all_results) >= max_results:
+                            break
 
-            context, sources = chat_service.build_search_context(all_results, fetched_pages)
-            if not context:
+                for result in all_results[:max_results]:
+                    url = result.get("url", "")
+                    host = urllib.parse.urlparse(url).hostname or url
+                    if host.startswith("www."):
+                        host = host[4:]
+                    writer.write({"type": "web_status", "content": f"Reading: {host}"})
+                    fetched_pages[url] = web_search.fetch_page_text(url, ssl_context=ctx.services.ssl_context)
+
+            # Direct URL/file reads get a larger per-source budget than search
+            # snippets so a full page or document (e.g. a CV) reaches the model.
+            max_source_chars = 12000 if has_direct_content else 3500
+            context, sources = chat_service.build_search_context(
+                all_results, fetched_pages, max_source_chars=max_source_chars
+            )
+            if not context and not vision_image_urls:
                 writer.write({"error": {"message": "Search returned no usable sources."}})
                 writer.write("[DONE]")
                 return
 
-            writer.write({"type": "web_sources", "sources": sources})
+            if sources:
+                writer.write({"type": "web_sources", "sources": sources})
             writer.write({"type": "web_status", "content": "Answering..."})
 
             proxied_messages = []
             inserted_context = False
             for msg in messages:
-                if msg.get("role") == "system" and not inserted_context:
+                if context and msg.get("role") == "system" and not inserted_context:
                     proxied_messages.append(
                         {
                             "role": "system",
@@ -87,8 +164,13 @@ def completions(request, response, ctx):
                             "content": msg.get("content", ""),
                         }
                     )
-            if not inserted_context:
+            if context and not inserted_context:
                 proxied_messages.insert(0, {"role": "system", "content": context})
+
+            if vision_image_urls:
+                proxied_messages = chat_service.attach_images_to_last_user_message(
+                    proxied_messages, vision_image_urls
+                )
 
         proxy_body = dict(body)
         proxy_body["messages"] = proxied_messages
@@ -99,7 +181,6 @@ def completions(request, response, ctx):
         proxy_body.pop("port", None)
         proxy_body.pop("web_search_max_results", None)
 
-        active_runtime = process_manager.get_active_runtime_snapshot(ctx)
         target = active_runtime if active_runtime and active_runtime.get("tool") == "llama-server" else body
         api_url = chat_service.get_local_chat_api_url(target)
         headers = {"Content-Type": "application/json"}

@@ -1,0 +1,10 @@
+{
+  "_comment": "Per-host request headers used when the chat 'Web Search' toggle fetches a page. Copy this file to web_auth.json (gitignored) and fill in real values. The most specific host suffix wins. Empty values are ignored.",
+  "decidalo.telekom.de": {
+    "Cookie": "PASTE_THE_COOKIE_HEADER_FROM_YOUR_BROWSER_HERE"
+  },
+  "some-other-internal-host.t-internal.com": {
+    "Cookie": "name=value; name2=value2",
+    "Authorization": "Bearer <optional-token>"
+  }
+}

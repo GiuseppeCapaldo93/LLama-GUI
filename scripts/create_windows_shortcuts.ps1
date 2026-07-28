@@ -116,9 +116,13 @@ if (`$null -eq `$python) {
     exit 1
 }
 
-`$serverParts = @(`$python.File) + `$python.Args + @("server.py")
-`$serverCommand = "& " + ((`$serverParts | ForEach-Object { Convert-ToSingleQuotedPowerShellLiteral `$_ }) -join " ")
-Start-Process -FilePath "powershell.exe" -WorkingDirectory `$rootDir -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", `$serverCommand) | Out-Null
+`$serverExe = `$python.File
+`$pythonwCandidate = Join-Path (Split-Path -Parent `$python.File) "pythonw.exe"
+if (Test-Path -LiteralPath `$pythonwCandidate) { `$serverExe = `$pythonwCandidate }
+`$logDir = Join-Path `$rootDir "logs"
+New-Item -ItemType Directory -Path `$logDir -Force | Out-Null
+`$serverArgs = @(`$python.Args) + @("server.py")
+Start-Process -FilePath `$serverExe -WorkingDirectory `$rootDir -ArgumentList `$serverArgs -WindowStyle Hidden -RedirectStandardOutput (Join-Path `$logDir "server.out.log") -RedirectStandardError (Join-Path `$logDir "server.err.log") | Out-Null
 
 if (Wait-ForLlamaGui -Url `$url) {
     Start-Process `$url
@@ -133,18 +137,35 @@ exit 1
     Set-Content -LiteralPath $LauncherPath -Value $content -Encoding UTF8
 }
 
+function Write-HiddenVbsLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string]$LauncherPath,
+        [Parameter(Mandatory = $true)][string]$VbsPath
+    )
+
+    $content = @"
+' Launches the Llama GUI launcher completely hidden (no PowerShell window on the desktop).
+Set sh = CreateObject("WScript.Shell")
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$LauncherPath""", 0, False
+"@
+
+    New-Item -ItemType Directory -Path (Split-Path -Parent $VbsPath) -Force | Out-Null
+    Set-Content -LiteralPath $VbsPath -Value $content -Encoding ASCII
+}
+
 function New-LlamaGuiShortcut {
     param(
         [Parameter(Mandatory = $true)][string]$ShortcutPath,
         [Parameter(Mandatory = $true)][string]$RootDir,
         [Parameter(Mandatory = $true)][string]$LauncherPath,
+        [Parameter(Mandatory = $true)][string]$VbsPath,
         [string]$IconPath
     )
 
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($ShortcutPath)
-    $shortcut.TargetPath = "powershell.exe"
-    $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$LauncherPath`""
+    $shortcut.TargetPath = "$env:WINDIR\System32\wscript.exe"
+    $shortcut.Arguments = "`"$VbsPath`""
     $shortcut.WorkingDirectory = $RootDir
     $shortcut.Description = "Start Llama GUI"
     if ($IconPath -and (Test-Path -LiteralPath $IconPath)) {
@@ -155,6 +176,7 @@ function New-LlamaGuiShortcut {
 
 $rootDir = Resolve-LlamaGuiInstallDir $InstallDir
 $launcherPath = Join-Path $rootDir ".launcher\launch-llama-gui.ps1"
+$vbsPath = Join-Path $rootDir ".launcher\start-llama-gui.vbs"
 $iconPath = Join-Path $rootDir "assets\Llama-GUI.ico"
 $desktopPath = [Environment]::GetFolderPath("Desktop")
 
@@ -169,12 +191,13 @@ if ($ShortcutsOnly) {
 }
 
 Write-LauncherScript -RootDir $rootDir -LauncherPath $launcherPath
+Write-HiddenVbsLauncher -LauncherPath $launcherPath -VbsPath $vbsPath
 
 if (-not $desktopPath) {
     throw "Could not locate the current user's Desktop folder."
 }
 
 $shortcutPath = Join-Path $desktopPath "Llama GUI.lnk"
-New-LlamaGuiShortcut -ShortcutPath $shortcutPath -RootDir $rootDir -LauncherPath $launcherPath -IconPath $iconPath
+New-LlamaGuiShortcut -ShortcutPath $shortcutPath -RootDir $rootDir -LauncherPath $launcherPath -VbsPath $vbsPath -IconPath $iconPath
 
 Write-Host "Shortcut ready: $shortcutPath"

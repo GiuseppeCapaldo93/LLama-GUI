@@ -20,8 +20,10 @@ from backend.services import chat as chat_service
 from backend.services import file_picker as file_picker_service
 from backend.services import hf_download as hf_service
 from backend.services import llama_manager
+from backend.services import local_files as local_files_service
 from backend.services import local_llama_http
 from backend.services import process_manager
+from backend.services import web_render as web_render_service
 from backend.services import web_search as web_search_service
 
 
@@ -2088,7 +2090,7 @@ class ValidateHfRevisionDirectTests(unittest.TestCase):
 
 class WebSearchDirectTests(unittest.TestCase):
     def test_web_search_rejects_empty_query_without_importing_ddgs(self):
-        result = web_search_service.web_search("   ")
+        result = web_search_service.ddgs_search("   ")
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["results"], [])
@@ -2103,7 +2105,7 @@ class WebSearchDirectTests(unittest.TestCase):
             return real_import(name, *args, **kwargs)
 
         with mock.patch("builtins.__import__", side_effect=fake_import):
-            result = web_search_service.web_search("llama gui")
+            result = web_search_service.ddgs_search("llama gui")
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["results"], [])
@@ -2126,7 +2128,7 @@ class WebSearchDirectTests(unittest.TestCase):
         fake_module = SimpleNamespace(DDGS=FakeDDGS)
 
         with mock.patch.dict("sys.modules", {"ddgs": fake_module}):
-            result = web_search_service.web_search(" llama gui ", max_results=2)
+            result = web_search_service.ddgs_search(" llama gui ", max_results=2)
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["query"], "llama gui")
@@ -2153,11 +2155,457 @@ class WebSearchDirectTests(unittest.TestCase):
         fake_module = SimpleNamespace(DDGS=FailingDDGS)
 
         with mock.patch.dict("sys.modules", {"ddgs": fake_module}):
-            result = web_search_service.web_search("llama gui")
+            result = web_search_service.ddgs_search("llama gui")
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["results"], [])
         self.assertIn("network down", result["error"])
+
+
+class WebSearchUnlockTests(unittest.TestCase):
+    def test_is_internal_host_matches_configured_suffixes(self):
+        with mock.patch.object(
+            web_search_service.config,
+            "WEB_SEARCH_INTERNAL_HOSTS",
+            ("telekom.de", "t-internal.com"),
+        ):
+            self.assertTrue(web_search_service.is_internal_host("decidalo.telekom.de"))
+            self.assertTrue(web_search_service.is_internal_host("TELEKOM.DE"))
+            self.assertTrue(web_search_service.is_internal_host("host.t-internal.com"))
+            self.assertFalse(web_search_service.is_internal_host("example.com"))
+            self.assertFalse(web_search_service.is_internal_host("nottelekom.de.evil.com"))
+            self.assertFalse(web_search_service.is_internal_host(""))
+
+    def test_extract_urls_finds_and_trims_trailing_punctuation(self):
+        urls = chat_service.extract_urls(
+            "see https://decidalo.telekom.de/redesign/Profile/Profile.aspx. and (http://x.test/a) too"
+        )
+        self.assertEqual(
+            urls,
+            [
+                "https://decidalo.telekom.de/redesign/Profile/Profile.aspx",
+                "http://x.test/a",
+            ],
+        )
+        self.assertEqual(chat_service.extract_urls("no links here"), [])
+
+    def test_extract_urls_strips_wrapping_characters(self):
+        clean = "https://decidalo.telekom.de/redesign/Profile/Profile.aspx"
+        for wrapped in (
+            f"Summarize my profile: `{clean}`",
+            f'Read "{clean}" please',
+            f"Fetch <{clean}>",
+            f"Here: '{clean}'",
+        ):
+            self.assertEqual(
+                chat_service.extract_urls(wrapped),
+                [clean],
+                msg=f"failed for input: {wrapped}",
+            )
+
+    def test_find_recent_urls_scans_history_newest_first(self):
+        messages = [
+            {"role": "assistant", "content": "the CV lives at https://decidalo.telekom.de/redesign/Profile/Profile.aspx"},
+            {"role": "user", "content": "could you try again to fetch the website content"},
+            {"role": "assistant", "content": "I cannot browse."},
+            {"role": "user", "content": "could you try again ?"},
+        ]
+        self.assertEqual(
+            chat_service.find_recent_urls(messages),
+            ["https://decidalo.telekom.de/redesign/Profile/Profile.aspx"],
+        )
+        self.assertEqual(chat_service.find_recent_urls([]), [])
+        self.assertEqual(
+            chat_service.find_recent_urls([{"role": "user", "content": "no url at all"}]),
+            [],
+        )
+
+    def test_find_recent_urls_prefers_most_recent_message(self):
+        messages = [
+            {"role": "user", "content": "old http://old.test/page"},
+            {"role": "assistant", "content": "see http://new.test/doc for details"},
+        ]
+        self.assertEqual(chat_service.find_recent_urls(messages), ["http://new.test/doc"])
+
+    def test_references_previous_page_detects_followups(self):
+        self.assertTrue(chat_service.references_previous_page("could you try again ?"))
+        self.assertTrue(chat_service.references_previous_page("please fetch the website content"))
+        self.assertTrue(chat_service.references_previous_page("read the page for me"))
+        self.assertFalse(chat_service.references_previous_page("what is the capital of France?"))
+        self.assertFalse(chat_service.references_previous_page("summarize quantum computing"))
+
+    def test_web_search_prefers_searxng_and_falls_back_to_ddgs(self):
+        searxng_ok = {
+            "ok": True,
+            "results": [{"title": "s", "url": "https://s.test", "snippet": ""}],
+        }
+        with mock.patch.object(
+            web_search_service.config, "WEB_SEARCH_SEARXNG_URL", "http://sx"
+        ), mock.patch.object(
+            web_search_service, "searxng_search", return_value=searxng_ok
+        ) as sx, mock.patch.object(
+            web_search_service, "ddgs_search"
+        ) as dd:
+            result = web_search_service.web_search("hello", max_results=3)
+        self.assertEqual(result, searxng_ok)
+        sx.assert_called_once_with("hello", max_results=3)
+        dd.assert_not_called()
+
+        empty = {"ok": True, "results": []}
+        ddgs_ok = {
+            "ok": True,
+            "results": [{"title": "d", "url": "https://d.test", "snippet": ""}],
+        }
+        with mock.patch.object(
+            web_search_service.config, "WEB_SEARCH_SEARXNG_URL", "http://sx"
+        ), mock.patch.object(
+            web_search_service, "searxng_search", return_value=empty
+        ), mock.patch.object(
+            web_search_service, "ddgs_search", return_value=ddgs_ok
+        ) as dd:
+            result = web_search_service.web_search("hello", max_results=3)
+        self.assertEqual(result, ddgs_ok)
+        dd.assert_called_once_with("hello", max_results=3)
+
+    def test_searxng_search_normalizes_results(self):
+        payload = json.dumps(
+            {
+                "results": [
+                    {"url": "https://a.test", "title": "A", "content": "body a"},
+                    {"title": "no url"},
+                    {"url": "https://b.test", "title": "B", "content": "body b"},
+                ]
+            }
+        ).encode("utf-8")
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n):
+                return payload
+
+        opener = mock.Mock()
+        opener.open.return_value = FakeResp()
+        with mock.patch.object(
+            web_search_service.config, "WEB_SEARCH_SEARXNG_URL", "http://sx:8888"
+        ), mock.patch.object(
+            web_search_service.urllib.request, "build_opener", return_value=opener
+        ):
+            result = web_search_service.searxng_search("q", max_results=1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["results"],
+            [{"title": "A", "url": "https://a.test", "snippet": "body a"}],
+        )
+
+    def test_auth_headers_for_reads_web_auth_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "web_auth.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "telekom.de": {"Cookie": "broad"},
+                        "decidalo.telekom.de": {"Cookie": "specific"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(web_search_service.config, "WEB_AUTH_FILE", path):
+                self.assertEqual(
+                    web_search_service.auth_headers_for("decidalo.telekom.de"),
+                    {"Cookie": "specific"},
+                )
+                self.assertEqual(
+                    web_search_service.auth_headers_for("other.telekom.de"),
+                    {"Cookie": "broad"},
+                )
+                self.assertEqual(web_search_service.auth_headers_for("example.com"), {})
+
+    def test_fetch_page_text_allows_private_ip_for_internal_host(self):
+        internal_addresses = [
+            (
+                web_search_service.socket.AF_INET,
+                web_search_service.socket.SOCK_STREAM,
+                6,
+                "",
+                ("10.206.94.132", 443),
+            )
+        ]
+        with mock.patch.object(
+            web_search_service.config, "WEB_SEARCH_INTERNAL_HOSTS", ("telekom.de",)
+        ), mock.patch.object(
+            web_search_service, "resolve_addresses", return_value=(internal_addresses, "")
+        ) as resolve_internal, mock.patch.object(
+            web_search_service, "resolve_public_addresses"
+        ) as resolve_public, mock.patch.object(
+            web_search_service,
+            "_open_validated_url",
+            return_value=(200, "OK", Message(), b"<html>ok</html>"),
+        ):
+            result = web_search_service.fetch_page_text("https://decidalo.telekom.de/x")
+        self.assertTrue(result["ok"])
+        resolve_internal.assert_called_once()
+        resolve_public.assert_not_called()
+
+    def test_fetch_page_text_uses_proxy_when_public_dns_fails(self):
+        with mock.patch.object(
+            web_search_service.config, "WEB_SEARCH_PROXY", "http://127.0.0.1:3128"
+        ), mock.patch.object(
+            web_search_service,
+            "resolve_public_addresses",
+            return_value=(None, "Failed to resolve host: getaddrinfo failed"),
+        ), mock.patch.object(
+            web_search_service,
+            "_open_validated_url",
+            return_value=(200, "OK", Message(), b"<html>hi</html>"),
+        ) as open_url:
+            result = web_search_service.fetch_page_text("https://example.com")
+        self.assertTrue(result["ok"])
+        open_url.assert_called_once()
+        self.assertEqual(open_url.call_args.args[1], [])
+
+    def test_fetch_page_text_blocks_private_ip_even_with_proxy(self):
+        with mock.patch.object(
+            web_search_service.config, "WEB_SEARCH_PROXY", "http://127.0.0.1:3128"
+        ), mock.patch.object(
+            web_search_service,
+            "resolve_public_addresses",
+            return_value=(None, "Blocked: refusing to fetch non-public address 10.0.0.5."),
+        ), mock.patch.object(
+            web_search_service, "_open_validated_url"
+        ) as open_url:
+            result = web_search_service.fetch_page_text("https://sneaky.example.com")
+        self.assertFalse(result["ok"])
+        self.assertIn("non-public address", result["error"])
+        open_url.assert_not_called()
+
+
+class LocalFilesTests(unittest.TestCase):
+    def test_extract_file_paths_finds_windows_and_quoted_paths(self):
+        text = (
+            r'see C:\Users\me\cv.pdf and "C:\Users\me\My Docs\notes.txt" plus '
+            r'`D:/data/report.docx` and \\server\share\file.md'
+        )
+        paths = local_files_service.extract_file_paths(text)
+        self.assertIn(r"C:\Users\me\cv.pdf", paths)
+        self.assertIn(r"C:\Users\me\My Docs\notes.txt", paths)
+        self.assertIn("D:/data/report.docx", paths)
+        self.assertIn(r"\\server\share\file.md", paths)
+        self.assertEqual(local_files_service.extract_file_paths("no paths here"), [])
+
+    def test_extract_file_paths_handles_unquoted_spaces(self):
+        text = (
+            r"C:\Users\A200334828\OneDrive - Deutsche Telekom AG\Bilder\Screenshots"
+            r"\Screenshot 2026-07-27 160914.png"
+        )
+        self.assertEqual(local_files_service.extract_file_paths(text), [text])
+        two = r"read C:\a\one.png and C:\b\two.txt please"
+        self.assertEqual(
+            local_files_service.extract_file_paths(two),
+            [r"C:\a\one.png", r"C:\b\two.txt"],
+        )
+        # URLs must not be mistaken for paths.
+        self.assertEqual(
+            local_files_service.extract_file_paths("go to https://x.test/a.html now"), []
+        )
+
+    def test_find_recent_file_paths_scans_history(self):
+        p = r"C:\Users\me\OneDrive - Team\Shot 2026.png"
+        messages = [
+            {"role": "user", "content": f"here is my screenshot {p}"},
+            {"role": "assistant", "content": "I cannot access files."},
+            {"role": "user", "content": "can you try again to read the file"},
+        ]
+        self.assertEqual(local_files_service.find_recent_file_paths(messages), [p])
+        self.assertEqual(local_files_service.find_recent_file_paths([]), [])
+
+    def test_read_local_file_reads_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "cv.txt"
+            p.write_text("Giuseppe Capaldo\nSenior IT Architect", encoding="utf-8")
+            result = local_files_service.read_local_file(str(p))
+        self.assertTrue(result["ok"])
+        self.assertIn("Senior IT Architect", result["text"])
+
+    def test_read_local_file_missing(self):
+        result = local_files_service.read_local_file(r"C:\nope\missing.txt")
+        self.assertFalse(result["ok"])
+        self.assertIn("File not found", result["error"])
+
+    def test_read_local_file_ocrs_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "shot.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n")
+            with mock.patch.object(
+                local_files_service, "_read_image_ocr", return_value=(True, "Giuseppe Capaldo")
+            ) as ocr:
+                result = local_files_service.read_local_file(str(p))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["text"], "Giuseppe Capaldo")
+        ocr.assert_called_once()
+
+    def test_read_image_ocr_disabled_returns_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "shot.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n")
+            with mock.patch.object(local_files_service.config, "WEB_OCR_ENABLED", False):
+                result = local_files_service.read_local_file(str(p))
+        self.assertFalse(result["ok"])
+        self.assertIn("OCR is disabled", result["error"])
+
+
+class WebRenderDispatchTests(unittest.TestCase):
+    def test_fetch_page_smart_uses_static_when_rendering_disabled(self):
+        with mock.patch.object(web_render_service.config, "WEB_RENDER_ENABLED", False), mock.patch.object(
+            web_render_service.web_search,
+            "fetch_page_text",
+            return_value={"ok": True, "text": "static"},
+        ) as static, mock.patch.object(web_render_service, "render_page") as render:
+            result = web_render_service.fetch_page_smart("https://example.com", ssl_context=None)
+        self.assertEqual(result["text"], "static")
+        static.assert_called_once()
+        render.assert_not_called()
+
+    def test_fetch_page_smart_renders_internal_hosts(self):
+        with mock.patch.object(web_render_service.config, "WEB_RENDER_ENABLED", True), mock.patch.object(
+            web_render_service, "is_available", return_value=True
+        ), mock.patch.object(
+            web_render_service.web_search, "is_internal_host", return_value=True
+        ), mock.patch.object(
+            web_render_service, "render_page", return_value={"ok": True, "text": "rendered CV"}
+        ) as render, mock.patch.object(
+            web_render_service.web_search, "fetch_page_text"
+        ) as static:
+            result = web_render_service.fetch_page_smart("https://decidalo.telekom.de/x")
+        self.assertEqual(result["text"], "rendered CV")
+        render.assert_called_once()
+        static.assert_not_called()
+
+    def test_fetch_page_smart_renders_public_only_on_thin_result(self):
+        with mock.patch.object(web_render_service.config, "WEB_RENDER_ENABLED", True), mock.patch.object(
+            web_render_service, "is_available", return_value=True
+        ), mock.patch.object(
+            web_render_service.web_search, "is_internal_host", return_value=False
+        ), mock.patch.object(
+            web_render_service.config, "WEB_RENDER_MIN_TEXT", 600
+        ), mock.patch.object(
+            web_render_service.web_search,
+            "fetch_page_text",
+            return_value={"ok": True, "text": "x" * 50},
+        ), mock.patch.object(
+            web_render_service, "render_page", return_value={"ok": True, "text": "y" * 900}
+        ) as render:
+            result = web_render_service.fetch_page_smart("https://example.com")
+        self.assertEqual(len(result["text"]), 900)
+        render.assert_called_once()
+
+    def test_fetch_page_smart_keeps_good_public_static_result(self):
+        with mock.patch.object(web_render_service.config, "WEB_RENDER_ENABLED", True), mock.patch.object(
+            web_render_service, "is_available", return_value=True
+        ), mock.patch.object(
+            web_render_service.web_search, "is_internal_host", return_value=False
+        ), mock.patch.object(
+            web_render_service.config, "WEB_RENDER_MIN_TEXT", 600
+        ), mock.patch.object(
+            web_render_service.web_search,
+            "fetch_page_text",
+            return_value={"ok": True, "text": "z" * 1200},
+        ), mock.patch.object(web_render_service, "render_page") as render:
+            result = web_render_service.fetch_page_smart("https://example.com")
+        self.assertEqual(len(result["text"]), 1200)
+        render.assert_not_called()
+
+
+class ImageAndMmprojTests(unittest.TestCase):
+    def test_is_image_path_and_encode_image_data_url(self):
+        self.assertTrue(local_files_service.is_image_path(r"C:\pics\shot.PNG"))
+        self.assertFalse(local_files_service.is_image_path(r"C:\docs\cv.pdf"))
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "pic.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\nDATA")
+            url = local_files_service.encode_image_data_url(str(p))
+        self.assertIsNotNone(url)
+        self.assertTrue(url.startswith("data:image/png;base64,"))
+        self.assertIsNone(local_files_service.encode_image_data_url(r"C:\nope\missing.png"))
+
+    def test_attach_images_to_last_user_message(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "look at this"},
+        ]
+        out = chat_service.attach_images_to_last_user_message(messages, ["data:image/png;base64,AAA"])
+        # Only the last user message is converted to multimodal parts.
+        self.assertEqual(out[1]["content"], "first")
+        last = out[3]["content"]
+        self.assertEqual(last[0], {"type": "text", "text": "look at this"})
+        self.assertEqual(last[1], {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}})
+        # No images -> unchanged content.
+        same = chat_service.attach_images_to_last_user_message(messages, [])
+        self.assertEqual(same[3]["content"], "look at this")
+
+    def test_normalize_model_key_strips_quant_and_mmproj(self):
+        self.assertEqual(
+            process_manager._normalize_model_key("Nemotron-3-Nano-Omni-30B-A3B-Reasoning-Q4_K_M.gguf"),
+            process_manager._normalize_model_key("mmproj-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16.gguf"),
+        )
+
+    def test_find_matching_mmproj_matches_companion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            models = root / "models"
+            mmproj_dir = models / "mmproj"
+            mmproj_dir.mkdir(parents=True)
+            (models / "Nemotron-Omni-30B-Q4_K_M.gguf").write_bytes(b"x")
+            companion = mmproj_dir / "mmproj-Nemotron-Omni-30B-BF16.gguf"
+            companion.write_bytes(b"y")
+            (mmproj_dir / "mmproj-Qwen3-BF16.gguf").write_bytes(b"z")
+            ctx = SimpleNamespace(paths=SimpleNamespace(models=models, root=root))
+            with mock.patch.object(process_manager.config, "MMPROJ_DIR", mmproj_dir):
+                match = process_manager.find_matching_mmproj(
+                    ctx, str(models / "Nemotron-Omni-30B-Q4_K_M.gguf")
+                )
+                self.assertEqual(match, companion)
+                (models / "LFM2-24B-Q4_K_M.gguf").write_bytes(b"x")
+                self.assertIsNone(
+                    process_manager.find_matching_mmproj(ctx, str(models / "LFM2-24B-Q4_K_M.gguf"))
+                )
+
+    def test_compute_auto_mmproj_args_respects_user_choice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            models = root / "models"
+            mmproj_dir = models / "mmproj"
+            mmproj_dir.mkdir(parents=True)
+            (models / "Vis-30B-Q4_K_M.gguf").write_bytes(b"x")
+            companion = mmproj_dir / "mmproj-Vis-30B-BF16.gguf"
+            companion.write_bytes(b"y")
+            ctx = SimpleNamespace(paths=SimpleNamespace(models=models, root=root))
+            with mock.patch.object(process_manager.config, "MMPROJ_DIR", mmproj_dir), mock.patch.object(
+                process_manager.config, "AUTO_MMPROJ_ENABLED", True
+            ):
+                base = ["-m", str(models / "Vis-30B-Q4_K_M.gguf")]
+                self.assertEqual(
+                    process_manager.compute_auto_mmproj_args(ctx, "llama-server", base),
+                    ["-mm", str(companion)],
+                )
+                self.assertEqual(
+                    process_manager.compute_auto_mmproj_args(ctx, "llama-server", base + ["-mm", "x.gguf"]),
+                    [],
+                )
+                self.assertEqual(
+                    process_manager.compute_auto_mmproj_args(ctx, "llama-server", base + ["--no-mmproj"]),
+                    [],
+                )
+            with mock.patch.object(process_manager.config, "AUTO_MMPROJ_ENABLED", False):
+                self.assertEqual(
+                    process_manager.compute_auto_mmproj_args(ctx, "llama-server", ["-m", "x"]), []
+                )
 
 
 if __name__ == "__main__":

@@ -39,6 +39,8 @@ codegraph/
 playwright-mcp/
 
 config.json
+web_auth.json
+browser_profile/
 potential_improvements.md
 
 # Local llama.cpp runtime install

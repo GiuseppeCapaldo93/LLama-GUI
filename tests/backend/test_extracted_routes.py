@@ -1088,6 +1088,7 @@ class ExtractedRouteTests(unittest.TestCase):
                     "tool": "llama-server",
                     "model": "models/qwen.gguf",
                     "alias": "qwen-local",
+                    "vision": False,
                     "host": "127.0.0.1",
                     "port": 9090,
                     "source": "manual",
@@ -2191,6 +2192,18 @@ class ExtractedRouteTests(unittest.TestCase):
         self.assertEqual(sources[0]["index"], 1)
         self.assertEqual(sources[0]["url"], "https://example.com")
 
+    def test_build_search_context_respects_max_source_chars(self):
+        long_text = "A" * 9000
+        results = [{"title": "Doc", "url": "file:///cv.txt", "snippet": ""}]
+        pages = {"file:///cv.txt": {"ok": True, "text": long_text}}
+
+        default_ctx, _ = chat_service.build_search_context(results, pages)
+        self.assertIn("truncated", default_ctx)
+        self.assertNotIn("A" * 4000, default_ctx)
+
+        wide_ctx, _ = chat_service.build_search_context(results, pages, max_source_chars=12000)
+        self.assertIn("A" * 9000, wide_ctx)
+
     def test_local_interface_addresses_are_cached(self):
         chat_service.get_local_interface_addresses.cache_clear()
         try:
@@ -2435,6 +2448,141 @@ class ExtractedRouteTests(unittest.TestCase):
             self.assertEqual(run_with_count(0), (1, 1))
             self.assertEqual(run_with_count(99), (10, 10))
             self.assertEqual(run_with_count("invalid"), (5, 5))
+
+    def test_chat_route_reads_file_without_web_search_toggle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp)
+            response = DummySseResponse()
+            captured = {}
+
+            def fake_urlopen(req, timeout):
+                captured["body"] = json.loads(req.data.decode("utf-8"))
+                return FakeSseUpstream([b"data: [DONE]\n\n"])
+
+            with mock.patch.object(chat.web_search, "web_search") as search_mock, mock.patch.object(
+                chat.local_files, "extract_file_paths", return_value=[r"C:\docs\cv.txt"]
+            ), mock.patch.object(
+                chat.local_files,
+                "read_local_file",
+                return_value={"ok": True, "text": "Senior IT Architect"},
+            ) as read_mock, mock.patch.object(
+                chat.chat_service,
+                "get_local_chat_api_url",
+                return_value="http://127.0.0.1:8080/v1/chat/completions",
+            ), mock.patch.object(chat.urllib.request, "urlopen", side_effect=fake_urlopen):
+                chat.completions(
+                    Request(
+                        "POST",
+                        "/api/chat/completions",
+                        "",
+                        {},
+                        body={
+                            # web_search NOT set: a bare file path must still
+                            # trigger reading.
+                            "messages": [
+                                {"role": "user", "content": r"summarize C:\docs\cv.txt"},
+                            ],
+                        },
+                    ),
+                    response,
+                    ctx,
+                )
+
+            search_mock.assert_not_called()
+            read_mock.assert_called_once_with(r"C:\docs\cv.txt")
+            system_message = captured["body"]["messages"][0]
+            self.assertIn("Senior IT Architect", system_message["content"])
+
+    def test_chat_route_fetches_url_from_history_when_message_has_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp)
+            response = DummySseResponse()
+            captured = {}
+            history_url = "https://decidalo.telekom.de/redesign/Profile/Profile.aspx"
+
+            def fake_urlopen(req, timeout):
+                captured["body"] = json.loads(req.data.decode("utf-8"))
+                return FakeSseUpstream([b"data: [DONE]\n\n"])
+
+            with mock.patch.object(
+                chat.web_search, "web_search"
+            ) as search_mock, mock.patch.object(
+                chat.web_render,
+                "fetch_page_smart",
+                return_value={"ok": True, "text": "Profile page text"},
+            ) as fetch_mock, mock.patch.object(
+                chat.chat_service,
+                "get_local_chat_api_url",
+                return_value="http://127.0.0.1:8080/v1/chat/completions",
+            ), mock.patch.object(chat.urllib.request, "urlopen", side_effect=fake_urlopen):
+                chat.completions(
+                    Request(
+                        "POST",
+                        "/api/chat/completions",
+                        "",
+                        {},
+                        body={
+                            "web_search": True,
+                            "messages": [
+                                {"role": "assistant", "content": f"the CV lives at {history_url}"},
+                                {"role": "user", "content": "could you try again ?"},
+                            ],
+                        },
+                    ),
+                    response,
+                    ctx,
+                )
+
+            # It should fetch the URL from history, not run a text search.
+            search_mock.assert_not_called()
+            fetch_mock.assert_called_once_with(history_url, ssl_context=ctx.services.ssl_context)
+            system_message = captured["body"]["messages"][0]
+            self.assertIn("Profile page text", system_message["content"])
+
+    def test_chat_route_ignores_history_url_for_unrelated_new_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_context(tmp)
+            response = DummySseResponse()
+            history_url = "https://decidalo.telekom.de/redesign/Profile/Profile.aspx"
+
+            def fake_urlopen(req, timeout):
+                return FakeSseUpstream([b"data: [DONE]\n\n"])
+
+            with mock.patch.object(
+                chat.web_search,
+                "web_search",
+                return_value={"ok": True, "results": [{"title": "W", "url": "https://w.test", "snippet": "s"}]},
+            ) as search_mock, mock.patch.object(
+                chat.web_search,
+                "fetch_page_text",
+                return_value={"ok": True, "text": "weather text"},
+            ) as fetch_mock, mock.patch.object(
+                chat.chat_service,
+                "get_local_chat_api_url",
+                return_value="http://127.0.0.1:8080/v1/chat/completions",
+            ), mock.patch.object(chat.urllib.request, "urlopen", side_effect=fake_urlopen):
+                chat.completions(
+                    Request(
+                        "POST",
+                        "/api/chat/completions",
+                        "",
+                        {},
+                        body={
+                            "web_search": True,
+                            "messages": [
+                                {"role": "assistant", "content": f"the CV lives at {history_url}"},
+                                {"role": "user", "content": "what is the weather in Berlin?"},
+                            ],
+                        },
+                    ),
+                    response,
+                    ctx,
+                )
+
+            # A fresh, unrelated query must run a text search, not re-fetch the old link.
+            search_mock.assert_called_once_with("what is the weather in Berlin?", max_results=5)
+            fetched_urls = [call.args[0] for call in fetch_mock.call_args_list]
+            self.assertNotIn(history_url, fetched_urls)
 
     def test_file_picker_route_uses_model_filters_for_model_purpose(self):
         with tempfile.TemporaryDirectory() as tmp:
